@@ -1,0 +1,4 @@
+region             = "us-east-1"
+project_name       = "crash-course"
+input_bucket_name  = "replace-with-a-globally-unique-bucket-name"
+results_table_name = "doc-processing-results"
