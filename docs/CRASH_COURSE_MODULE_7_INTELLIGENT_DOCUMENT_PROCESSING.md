@@ -1,8 +1,15 @@
-# Module 7: Intelligent Document Processing Pipeline
+# Module 7: Intelligent Document Processing Pipeline (Incremental Workflow)
 
-## Architecture First
+This module uses a strict development loop:
 
-Before writing a single `.tf` file, map the infra. Here is what you are building and why each piece exists:
+1. **Build** a tiny slice
+2. **Validate** with one command
+3. **Observe** one concrete signal
+4. **Commit** only if green
+
+If a checkpoint fails, fix it before moving forward.
+
+## Target Architecture
 
 ```text
 PDF uploaded to S3
@@ -30,15 +37,11 @@ EventBridge Rule  -->  Step Functions State Machine
                   DONE
 ```
 
-### Why EventBridge instead of direct S3 -> Step Functions?
+## Why this trigger pattern?
 
-S3 does not trigger Step Functions directly. The pattern is: enable S3 EventBridge notifications on your bucket, then create an EventBridge rule that watches for Object Created events from that bucket and targets the state machine.
-
-### Why Step Functions instead of one big Lambda?
-
-Step Functions lets each stage fail, retry, and report independently. If text extraction succeeds but AI analysis fails, you retry only the analysis step — not the whole pipeline.
-
-It is important to note that the Step Functions IAM role and each Lambda IAM role are separate. The state machine needs `lambda:InvokeFunction` permission, while each Lambda runs under its own role with its own permissions.
+- S3 cannot directly start Step Functions.
+- You must enable S3 -> EventBridge forwarding on the bucket.
+- Then create an EventBridge rule targeting the state machine.
 
 ## File Structure
 
@@ -61,82 +64,158 @@ doc-processor/
       handler.py
 ```
 
-## Step 1: Core Storage Resources
+---
 
-Start with `main.tf`. This sets up the S3 bucket (with EventBridge enabled) and the DynamoDB table.
+## Milestone 0: Bootstrap Terraform Skeleton
 
-```hcl
-resource "aws_s3_bucket" "pdf_input" {
-  bucket = var.input_bucket_name
-}
+### Build
 
-resource "aws_s3_bucket_notification" "pdf_input_eventbridge" {
-  bucket      = aws_s3_bucket.pdf_input.id
-  eventbridge = true
-}
+Create:
 
-resource "aws_dynamodb_table" "results" {
-  name         = var.results_table_name
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "document_id"
+- `variables.tf`
+- `outputs.tf`
+- provider block in `main.tf`
+- `terraform.tfvars.example`
 
-  attribute {
-    name = "document_id"
-    type = "S"
-  }
-}
-```
-
-### Test
+### Validate
 
 ```bash
 terraform init
+terraform validate
+```
+
+### Observe
+
+- `terraform validate` prints `Success! The configuration is valid.`
+
+### Commit checkpoint
+
+```bash
+git add doc-processor/{main.tf,variables.tf,outputs.tf,terraform.tfvars.example}
+git commit -m "Bootstrap doc-processor terraform module"
+```
+
+### Stop sign
+
+Do not proceed until init and validate are green.
+
+---
+
+## Milestone 1: Add Core Data Plane (S3 + DDB)
+
+### Build
+
+In `main.tf`, add:
+
+- `aws_s3_bucket.pdf_input`
+- `aws_s3_bucket_notification.pdf_input_eventbridge` with `eventbridge = true`
+- `aws_dynamodb_table.results`
+
+### Validate
+
+```bash
 terraform plan
 ```
 
-You should see bucket, bucket notification, and DDB table in the plan.
+### Observe
 
-## Step 2: Lambda Functions (the workers)
+Plan should include these **3 adds** (names may differ by prefix):
 
-`lambdas.tf` packages three local Python handlers with `archive_file`, then defines three Lambda functions:
+- S3 bucket
+- S3 bucket notification
+- DynamoDB table
 
-- `extract`: Textract stage
-- `analyze`: Bedrock/Claude stage
-- `store`: DynamoDB persistence stage
+### Commit checkpoint
 
-Handler stubs exist in:
+```bash
+git add doc-processor/main.tf
+git commit -m "Add S3 input bucket and DynamoDB results table"
+```
 
+### Common failure
+
+- `input_bucket_name` not globally unique -> choose a unique value in `terraform.tfvars`.
+
+---
+
+## Milestone 2: Add Worker Lambdas + Local Packaging
+
+### Build
+
+Create/update:
+
+- `lambdas.tf`
 - `lambda/extract/handler.py`
 - `lambda/analyze/handler.py`
 - `lambda/store/handler.py`
 
-### Test
+Use `archive_file` data sources to package each handler zip.
+
+### Validate
 
 ```bash
 terraform plan
+python3 -m py_compile lambda/extract/handler.py lambda/analyze/handler.py lambda/store/handler.py
 ```
 
-If packaging paths are valid, plan runs without source file errors.
+### Observe
 
-## Step 3: IAM Roles and Policies
+- Plan includes **3 new Lambda resources**
+- Python compile command exits successfully (no syntax errors)
 
-`iam.tf` creates three trust boundaries:
+### Commit checkpoint
 
-1. **Lambda execution role** for worker Lambdas
-2. **Step Functions execution role** that can invoke Lambdas (+ write execution logs)
-3. **EventBridge role** that can call `states:StartExecution`
+```bash
+git add doc-processor/lambdas.tf doc-processor/lambda
+git commit -m "Add extract analyze store lambda workers"
+```
 
-At runtime, nearly all AccessDenied failures are policy issues in this file.
+### Common failure
 
-### Test
+- `archive_file` source path typos cause plan errors.
+
+---
+
+## Milestone 3: Add IAM Boundaries
+
+### Build
+
+Create `iam.tf` with:
+
+1. Lambda execution role + policies (`logs`, `s3:GetObject`, `textract:*`, `bedrock:InvokeModel`, `dynamodb:PutItem/UpdateItem`)
+2. Step Functions role with `lambda:InvokeFunction` (+ logging permissions)
+3. EventBridge role with `states:StartExecution`
+
+### Validate
 
 ```bash
 terraform validate
+terraform plan
 ```
 
-## Step 4: State Machine Definition
+### Observe
 
-`stepfunctions.tf` defines:
+- Validate succeeds
+- Plan shows IAM roles, role policies, and policy attachment
+
+### Commit checkpoint
+
+```bash
+git add doc-processor/iam.tf
+git commit -m "Add IAM roles for lambda stepfunctions and eventbridge"
+```
+
+### Common failure
+
+- AccessDenied at runtime almost always traces back to missing action or wrong resource ARN in this file.
+
+---
+
+## Milestone 4: Add Step Functions Orchestration
+
+### Build
+
+Create `stepfunctions.tf` with states:
 
 - `ExtractText`
 - `AnalyzeText`
@@ -144,76 +223,152 @@ terraform validate
 - `RecordFailure`
 - `ProcessingFailed`
 
-Key implementation details:
+Include:
 
-- Uses `arn:aws:states:::lambda:invoke` integration pattern
-- Uses `Retry` blocks with exponential backoff
-- Uses `Catch` blocks to route failures into `RecordFailure`
-- Writes Step Functions execution logs to CloudWatch
+- `Retry` on task states
+- `Catch` to route to `RecordFailure`
+- CloudWatch Logs group and logging config
 
-### Test
+### Validate
 
 ```bash
-terraform apply
+terraform plan
 ```
 
-Then verify the state machine graph in the Step Functions console.
+### Observe
 
-## Step 5: EventBridge Rule (the trigger)
+- Plan includes state machine and log group
+- Definition references the three Lambda ARNs
 
-`eventbridge.tf` connects S3 uploads to the state machine:
+### Commit checkpoint
 
-- Event pattern filters to your bucket
-- Key suffix filter only allows `.pdf`
-- Target is the state machine ARN
+```bash
+git add doc-processor/stepfunctions.tf
+git commit -m "Add state machine with retry catch and failure recording"
+```
 
-### Test (end-to-end)
+### Common failure
+
+- Invalid ASL JSON shape (especially JSONPath keys ending in `.$`) causes state machine creation failure.
+
+---
+
+## Milestone 5: Add EventBridge Trigger Wiring
+
+### Build
+
+Create `eventbridge.tf` with:
+
+- Rule filtering:
+  - `source = aws.s3`
+  - `detail-type = Object Created`
+  - matching bucket name
+  - key suffix `.pdf`
+- Target pointing to the state machine ARN
+- EventBridge role ARN attached on target
+
+### Validate
+
+```bash
+terraform plan
+```
+
+### Observe
+
+- Plan shows EventBridge rule + target
+- Target ARN points to the Step Functions state machine
+
+### Commit checkpoint
+
+```bash
+git add doc-processor/eventbridge.tf
+git commit -m "Wire S3 object events to state machine via EventBridge"
+```
+
+### Common failure
+
+- Forgetting `aws_s3_bucket_notification` with `eventbridge = true` means rule never receives S3 events.
+
+---
+
+## Milestone 6: Deploy and Verify Happy Path
+
+### Build
+
+Apply all accumulated changes.
+
+### Validate
 
 ```bash
 terraform apply
 aws s3 cp test.pdf s3://<your-input-bucket-name>/
 ```
 
-Within seconds, a new execution should appear in Step Functions.
+### Observe
 
-## Step 6: Variables and Outputs
+1. A new Step Functions execution appears within a few seconds.
+2. Execution path reaches `StoreResults`.
+3. DynamoDB contains item with at least:
+   - `document_id`
+   - `status = SUCCEEDED`
+   - `analysis`
 
-Variables include:
+### Commit checkpoint
 
-- `region`
-- `project_name`
-- `input_bucket_name`
-- `results_table_name`
+No code change required unless you fixed issues discovered during runtime verification. If you changed code, commit with a focused fix message.
 
-Outputs include:
+---
 
-- `input_bucket`
-- `results_table`
-- `state_machine_arn`
-- `event_rule_name`
+## Milestone 7: Verify Failure Path (Critical)
 
-## Key Concepts Introduced in This Module
+### Build
 
-| Concept | What you learned |
-| --- | --- |
-| `aws_s3_bucket_notification` with `eventbridge = true` | How to forward S3 events to EventBridge |
-| `aws_cloudwatch_event_rule` + `event_pattern` | How to filter S3 events by bucket and key suffix |
-| `aws_cloudwatch_event_target` | How to route a matching event to a Step Functions execution |
-| `aws_sfn_state_machine` with `jsonencode` | How to define ASL state machine logic inside Terraform |
-| `Retry` and `Catch` in ASL | Per-step retry with exponential backoff and failure routing |
-| Separate IAM roles per service | Lambda role, SFN role, EventBridge role with least privilege boundaries |
+Temporarily force `lambda/analyze/handler.py` to raise an exception.
+
+### Validate
+
+```bash
+terraform apply
+aws s3 cp test.pdf s3://<your-input-bucket-name>/
+```
+
+### Observe
+
+1. `AnalyzeText` retries per policy.
+2. Workflow transitions to `RecordFailure`.
+3. DynamoDB stores failure row with:
+   - `status = FAILED`
+   - `error` payload
+4. Execution ends in `ProcessingFailed`.
+
+### Commit checkpoint
+
+Revert the forced error and commit restoration:
+
+```bash
+git add doc-processor/lambda/analyze/handler.py
+git commit -m "Restore analyze lambda after failure-path verification"
+```
+
+---
+
+## Verification Matrix (Quick Reference)
+
+| Milestone | Command | Pass signal |
+| --- | --- | --- |
+| 0 | `terraform validate` | Config valid |
+| 1 | `terraform plan` | S3 + notification + DDB |
+| 2 | `terraform plan` + `py_compile` | Lambda resources + no syntax errors |
+| 3 | `terraform validate` | IAM compiles cleanly |
+| 4 | `terraform plan` | SFN + log group planned |
+| 5 | `terraform plan` | EventBridge rule + target planned |
+| 6 | Upload PDF | SFN success, DDB success row |
+| 7 | Inject failure + upload PDF | SFN fail branch, DDB failure row |
 
 ## What to Replace the Stubs With
 
-When making this production-ready:
+When productionizing:
 
 - **extract**: `boto3.client("textract").detect_document_text(...)`
 - **analyze**: `boto3.client("bedrock-runtime").invoke_model(...)`
-- **store**: Keep as-is, but evolve DynamoDB item schema to your analysis payload
-
-## Brief Manual QA
-
-1. Upload a `.pdf`; verify a new Step Functions execution starts.
-2. Confirm execution reaches `StoreResults` in success path.
-3. Query DynamoDB and confirm item exists with `document_id` and `status`.
-4. Simulate failure in `analyze`; verify `RecordFailure` writes error payload with `status = FAILED`.
+- **store**: keep handler shape, then evolve DDB item schema to your final analysis model
